@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Compute stack: ALB in public subnets, Bastion in public subnet,
+  App instances (Ubuntu + nginx) in private subnets. Separate SGs for ALB/App/Bastion.
+  Imports VPC/Subnet IDs from the Network stack via Export/ImportValue.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: prod
+    Description: Must match the EnvironmentName used in the VPC stack exports
+
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 KeyPair for Bastion (and optional app SSH if ever needed)
+
+  BastionAllowedSSHCidr:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: Your public IP /32 recommended (e.g., 203.0.113.10/32)
+
+  AppInstanceType:
+    Type: String
+    Default: t2.micro
+
+  BastionInstanceType:
+    Type: String
+    Default: t2.micro
+
+  DesiredCapacity:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 6
+
+  LatestUbuntuAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+    Description: Latest Ubuntu 24.04 LTS AMI via SSM public parameter
+
+Resources:
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvironmentName} ALB SG (HTTP from Internet)"
+      VpcId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-sg-alb"
+
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvironmentName} Bastion SG (SSH from allowed CIDR)"
+      VpcId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref BastionAllowedSSHCidr
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-sg-bastion"
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${EnvironmentName} App SG (HTTP from ALB, SSH from Bastion only)"
+      VpcId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          SourceSecurityGroupId: !Ref BastionSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-sg-app"
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvironmentName}-alb"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !ImportValue
+          Fn::Sub: "${EnvironmentName}-PublicSubnetAz1Id"
+        - !ImportValue
+          Fn::Sub: "${EnvironmentName}-PublicSubnetAz2Id"
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-alb"
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${EnvironmentName}-tg"
+      VpcId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-VpcId"
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      Matcher:
+        HttpCode: "200-399"
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-tg"
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+
+  BastionHost:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestUbuntuAmiId
+      InstanceType: !Ref BastionInstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !ImportValue
+        Fn::Sub: "${EnvironmentName}-PublicSubnetAz1Id"
+      SecurityGroupIds:
+        - !Ref BastionSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-bastion"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y curl telnet netcat-openbsd
+
+          echo "${EnvironmentName} bastion ready" | tee /etc/motd
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestUbuntuAmiId
+        InstanceType: !Ref AppInstanceType
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        MetadataOptions:
+          HttpTokens: required
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${EnvironmentName}-app"
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -y
+            apt-get install -y nginx curl
+
+            systemctl enable nginx
+            systemctl start nginx
+
+            TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+            IID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/instance-id)
+
+            AZ=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/placement/availability-zone)
+
+            HN=$(hostname)
+
+            cat > /var/www/html/index.html <<EOF
+            <html>
+              <head><title>${EnvironmentName} - Ubuntu Nginx App</title></head>
+              <body style="font-family: Arial;">
+                <h1>${EnvironmentName} - App Server</h1>
+                <p><b>Instance ID:</b> $IID</p>
+                <p><b>Hostname:</b> $HN</p>
+                <p><b>AZ:</b> $AZ</p>
+                <p><b>Time:</b> $(date)</p>
+              </body>
+            </html>
+            EOF
+
+            systemctl restart nginx
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !ImportValue
+          Fn::Sub: "${EnvironmentName}-PrivateSubnetAz1Id"
+        - !ImportValue
+          Fn::Sub: "${EnvironmentName}-PrivateSubnetAz2Id"
+      DesiredCapacity: !Ref DesiredCapacity
+      MinSize: !Ref DesiredCapacity
+      MaxSize: !Ref DesiredCapacity
+      TargetGroupARNs:
+        - !Ref AppTargetGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-app-asg"
+          PropagateAtLaunch: true
+
+Outputs:
+  AlbDnsName:
+    Description: ALB DNS name (open this in browser)
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+
+  BastionPublicIp:
+    Description: Bastion public IP (SSH here first)
+    Value: !GetAtt BastionHost.PublicIp
