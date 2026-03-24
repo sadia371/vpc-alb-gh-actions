@@ -1,0 +1,250 @@
+name: Deploy AWS Network and ALB
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/deploy-aws-infra.yml"
+      - "vpc-stack.yml"
+      - "alb-stack.yml"
+  workflow_dispatch:
+    inputs:
+      aws_region:
+        description: AWS region to deploy into
+        required: false
+        default: us-east-1
+      environment_name:
+        description: Prefix shared by both CloudFormation stacks
+        required: false
+        default: prod
+      vpc_stack_name:
+        description: CloudFormation stack name for the VPC template
+        required: false
+        default: prod-vpc-stack
+      alb_stack_name:
+        description: CloudFormation stack name for the ALB template
+        required: false
+        default: prod-alb-stack
+      key_name:
+        description: Existing EC2 key pair name for the bastion host
+        required: true
+      bastion_allowed_ssh_cidr:
+        description: CIDR allowed to SSH into the bastion host
+        required: false
+        default: 0.0.0.0/0
+      desired_capacity:
+        description: Number of application instances in the Auto Scaling Group
+        required: false
+        default: "3"
+      app_instance_type:
+        description: EC2 instance type for the app servers
+        required: false
+        default: t2.micro
+      bastion_instance_type:
+        description: EC2 instance type for the bastion host
+        required: false
+        default: t2.micro
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aws-infra-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ github.event.inputs.aws_region || vars.AWS_REGION || 'us-east-1' }}
+  ENVIRONMENT_NAME: ${{ github.event.inputs.environment_name || vars.ENVIRONMENT_NAME || 'prod' }}
+  VPC_STACK_NAME: ${{ github.event.inputs.vpc_stack_name || vars.VPC_STACK_NAME || 'prod-vpc-stack' }}
+  ALB_STACK_NAME: ${{ github.event.inputs.alb_stack_name || vars.ALB_STACK_NAME || 'prod-alb-stack' }}
+  EC2_KEY_NAME: ${{ github.event.inputs.key_name || vars.EC2_KEY_NAME || '' }}
+  BASTION_ALLOWED_SSH_CIDR: ${{ github.event.inputs.bastion_allowed_ssh_cidr || vars.BASTION_ALLOWED_SSH_CIDR || '0.0.0.0/0' }}
+  DESIRED_CAPACITY: ${{ github.event.inputs.desired_capacity || vars.DESIRED_CAPACITY || '3' }}
+  APP_INSTANCE_TYPE: ${{ github.event.inputs.app_instance_type || vars.APP_INSTANCE_TYPE || 't2.micro' }}
+  BASTION_INSTANCE_TYPE: ${{ github.event.inputs.bastion_instance_type || vars.BASTION_INSTANCE_TYPE || 't2.micro' }}
+  AWS_ROLE_TO_ASSUME_SECRET: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+  AWS_ACCESS_KEY_ID_SECRET: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY_SECRET: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_SESSION_TOKEN_SECRET: ${{ secrets.AWS_SESSION_TOKEN }}
+
+jobs:
+  validate:
+    name: Validate CloudFormation templates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify required settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${EC2_KEY_NAME}" ]]; then
+            echo "EC2_KEY_NAME is required. Set repo variable EC2_KEY_NAME or provide the workflow_dispatch key_name input."
+            exit 1
+          fi
+
+          if [[ -z "${AWS_ROLE_TO_ASSUME_SECRET}" && ( -z "${AWS_ACCESS_KEY_ID_SECRET}" || -z "${AWS_SECRET_ACCESS_KEY_SECRET}" ) ]]; then
+            echo "Provide AWS_ROLE_TO_ASSUME for OIDC or AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY secrets for static credentials."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials with OIDC
+        if: ${{ env.AWS_ROLE_TO_ASSUME_SECRET != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME_SECRET }}
+
+      - name: Configure AWS credentials with access keys
+        if: ${{ env.AWS_ROLE_TO_ASSUME_SECRET == '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID_SECRET }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY_SECRET }}
+          aws-session-token: ${{ env.AWS_SESSION_TOKEN_SECRET }}
+
+      - name: Validate VPC template
+        run: aws cloudformation validate-template --template-body file://vpc-stack.yml
+
+      - name: Validate ALB template
+        run: aws cloudformation validate-template --template-body file://alb-stack.yml
+
+      - name: Validate EC2 key pair exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws ec2 describe-key-pairs \
+            --region "${AWS_REGION}" \
+            --key-names "${EC2_KEY_NAME}" >/dev/null
+
+  deploy-vpc:
+    name: Deploy VPC stack
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        if: ${{ env.AWS_ROLE_TO_ASSUME_SECRET != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME_SECRET }}
+
+      - name: Configure AWS credentials with access keys
+        if: ${{ env.AWS_ROLE_TO_ASSUME_SECRET == '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID_SECRET }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY_SECRET }}
+          aws-session-token: ${{ env.AWS_SESSION_TOKEN_SECRET }}
+
+      - name: Deploy VPC stack
+        id: deploy_vpc
+        run: >
+          aws cloudformation deploy
+          --region "${AWS_REGION}"
+          --stack-name "${VPC_STACK_NAME}"
+          --template-file vpc-stack.yml
+          --no-fail-on-empty-changeset
+          --parameter-overrides
+          EnvironmentName="${ENVIRONMENT_NAME}"
+
+      - name: Show VPC stack failure events
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          aws cloudformation describe-stack-events \
+            --region "${AWS_REGION}" \
+            --stack-name "${VPC_STACK_NAME}" \
+            --query "StackEvents[0:20].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
+            --output table || true
+
+  deploy-alb:
+    name: Deploy ALB and compute stack
+    runs-on: ubuntu-latest
+    needs: deploy-vpc
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials with OIDC
+        if: ${{ env.AWS_ROLE_TO_ASSUME_SECRET != '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ env.AWS_ROLE_TO_ASSUME_SECRET }}
+
+      - name: Configure AWS credentials with access keys
+        if: ${{ env.AWS_ROLE_TO_ASSUME_SECRET == '' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: ${{ env.AWS_REGION }}
+          aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID_SECRET }}
+          aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY_SECRET }}
+          aws-session-token: ${{ env.AWS_SESSION_TOKEN_SECRET }}
+
+      - name: Deploy ALB stack
+        id: deploy_alb
+        run: >
+          aws cloudformation deploy
+          --region "${AWS_REGION}"
+          --stack-name "${ALB_STACK_NAME}"
+          --template-file alb-stack.yml
+          --no-fail-on-empty-changeset
+          --parameter-overrides
+          EnvironmentName="${ENVIRONMENT_NAME}"
+          KeyName="${EC2_KEY_NAME}"
+          BastionAllowedSSHCidr="${BASTION_ALLOWED_SSH_CIDR}"
+          DesiredCapacity="${DESIRED_CAPACITY}"
+          AppInstanceType="${APP_INSTANCE_TYPE}"
+          BastionInstanceType="${BASTION_INSTANCE_TYPE}"
+
+      - name: Show ALB stack failure events
+        if: ${{ failure() }}
+        shell: bash
+        run: |
+          aws cloudformation describe-stack-events \
+            --region "${AWS_REGION}" \
+            --stack-name "${ALB_STACK_NAME}" \
+            --query "StackEvents[0:30].[Timestamp,LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
+            --output table || true
+
+      - name: Publish stack outputs
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ALB_DNS=$(aws cloudformation describe-stacks \
+            --region "${AWS_REGION}" \
+            --stack-name "${ALB_STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='AlbDnsName'].OutputValue" \
+            --output text)
+
+          BASTION_IP=$(aws cloudformation describe-stacks \
+            --region "${AWS_REGION}" \
+            --stack-name "${ALB_STACK_NAME}" \
+            --query "Stacks[0].Outputs[?OutputKey=='BastionPublicIp'].OutputValue" \
+            --output text)
+
+          {
+            echo "## Deployment summary"
+            echo ""
+            echo "- Region: ${AWS_REGION}"
+            echo "- Environment: ${ENVIRONMENT_NAME}"
+            echo "- VPC stack: ${VPC_STACK_NAME}"
+            echo "- ALB stack: ${ALB_STACK_NAME}"
+            echo "- ALB DNS: ${ALB_DNS}"
+            echo "- Bastion public IP: ${BASTION_IP}"
+          } >> "${GITHUB_STEP_SUMMARY}"
